@@ -1,0 +1,37 @@
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+
+guardrails:
+    - guardrail_name: "presidio-pii"
+      litellm_params:
+        guardrail: presidio
+        mode: "pre_call"
+        presidio_language: "en"
+        pii_entities_config:
+          CREDIT_CARD: "MASK"
+          EMAIL_ADDRESS: "MASK"
+          US_SSN: "MASK"
+          IN_PAN: "BLOCK"
+          IN_AADHAAR: "BLOCK"
+        presidio_score_thresholds:  # minimum confidence scores for keeping detections
+          CREDIT_CARD: 0.8
+          EMAIL_ADDRESS: 0.6
+          IN_AADHAAR: 0.8
+          IN_PAN: 0.8

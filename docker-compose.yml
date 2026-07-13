@@ -1,0 +1,251 @@
+name: agentic-platform
+
+services:
+  # ---------------------------------------------------------------------
+  # Kong — single API gateway/ingress for the whole platform. Only Kong's
+  # proxy port and LiteLLM's admin UI are published to the host; every
+  # other service, including Kong's own Admin API and Kong Manager (its
+  # bundled admin UI), is reached through Kong's proxy port.
+  # ---------------------------------------------------------------------
+  kong-db:
+    image: postgres:16-alpine
+    container_name: kong-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: kong
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: kong
+    volumes:
+      - kong-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kong"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kong-migrations:
+    image: kong:3.8
+    container_name: kong-migrations
+    restart: "no"
+    command: kong migrations bootstrap
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-db
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong
+      KONG_PG_DATABASE: kong
+    depends_on:
+      kong-db:
+        condition: service_healthy
+
+  kong:
+    image: kong:3.8
+    container_name: kong
+    restart: unless-stopped
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-db
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong
+      KONG_PG_DATABASE: kong
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      # Kong Manager — the OSS admin UI bundled into the Kong image itself
+      # (no separate container or database). Listens on 8002, kept
+      # internal-only and reached via Kong's own proxy at /kong-manager/*
+      # (see infra/kong/bootstrap.sh), matching the "only LiteLLM is a
+      # direct exception" rule.
+      KONG_ADMIN_GUI_LISTEN: 0.0.0.0:8002
+      KONG_ADMIN_GUI_URL: http://localhost:8000/kong-manager
+      KONG_ADMIN_GUI_API_URL: http://localhost:8000/kong-admin
+    ports:
+      - "8000:8000"   # Kong proxy — single entry point for all platform traffic
+    expose:
+      - "8001"        # Kong Admin API — internal only; reached via Kong itself at /kong-admin/*
+      - "8002"        # Kong Manager UI — internal only; reached via Kong itself at /kong-manager/*
+    depends_on:
+      kong-migrations:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------
+  # LLM Gateway — official LiteLLM proxy image. All LLM traffic in the
+  # platform flows through Kong (/llm/*). Port 4000 is ALSO published
+  # directly to the host below so the LiteLLM Admin UI can be used without
+  # going through Kong — this is a deliberate, single-service exception to
+  # the "Kong is the only ingress" rule (see CLAUDE.md). The UI needs
+  # direct, un-prefixed access since it's a full SPA with hardcoded
+  # internal routes that don't tolerate Kong's /llm path-stripping.
+  # ---------------------------------------------------------------------
+  llm-gateway:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: llm-gateway
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./llm-gateway/config:/app/config
+    command: ["--config", "/app/config/config.yaml", "--port", "4000"]
+    env_file:
+      - ./llm-gateway/.env
+    environment:
+      PRESIDIO_ANALYZER_API_BASE: http://presidio-analyzer:3000
+      PRESIDIO_ANONYMIZER_API_BASE: http://presidio-anonymizer:3000
+    depends_on:
+      llm-gateway-db:
+        condition: service_healthy
+      presidio-analyzer:
+        condition: service_started
+      presidio-anonymizer:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------
+  # Presidio — PII detection/anonymization backing the `presidio-pii`
+  # guardrail declared in llm-gateway/config/config.yaml. Internal only;
+  # llm-gateway is the only caller.
+  # ---------------------------------------------------------------------
+  presidio-analyzer:
+    image: mcr.microsoft.com/presidio-analyzer:latest
+    container_name: presidio-analyzer
+    restart: unless-stopped
+    expose:
+      - "3000"
+
+  presidio-anonymizer:
+    image: mcr.microsoft.com/presidio-anonymizer:latest
+    container_name: presidio-anonymizer
+    restart: unless-stopped
+    expose:
+      - "3000"
+
+  llm-gateway-db:
+    image: postgres:16-alpine
+    container_name: llm-gateway-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm
+    volumes:
+      - llm-gateway-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # Agent Registry — catalog + metadata store for agents (capabilities,
+  # owners, versions, which LLM Gateway keys / MCP servers they use).
+  # ---------------------------------------------------------------------
+  agent-registry:
+    build:
+      context: ./services/agent-registry
+    container_name: agent-registry
+    restart: unless-stopped
+    expose:
+      - "8000"
+    env_file:
+      - ./services/agent-registry/.env
+    depends_on:
+      agent-registry-db:
+        condition: service_healthy
+      llm-gateway:
+        condition: service_healthy
+
+  agent-registry-db:
+    image: postgres:16-alpine
+    container_name: agent-registry-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agent_registry
+      POSTGRES_USER: agent_registry
+      POSTGRES_PASSWORD: agent_registry
+    volumes:
+      - agent-registry-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_registry"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # MCP Registry — thin control-plane wrapper around LiteLLM's native MCP
+  # server management (/v1/mcp/server). No database of its own: LiteLLM is
+  # the source of truth for registered MCP servers.
+  # ---------------------------------------------------------------------
+  mcp-registry:
+    build:
+      context: ./services/mcp-registry
+    container_name: mcp-registry
+    restart: unless-stopped
+    expose:
+      - "8000"
+    env_file:
+      - ./services/mcp-registry/.env
+    depends_on:
+      llm-gateway:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # MCP Gateway — proxies MCP protocol traffic through to LiteLLM's
+  # unified MCP endpoint (/mcp), which aggregates every MCP server
+  # registered via the MCP Registry and enforces per-key access control.
+  # ---------------------------------------------------------------------
+  mcp-gateway:
+    build:
+      context: ./services/mcp-gateway
+    container_name: mcp-gateway
+    restart: unless-stopped
+    expose:
+      - "8000"
+    env_file:
+      - ./services/mcp-gateway/.env
+    depends_on:
+      llm-gateway:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # Kong bootstrap — declares services/routes on the Kong Admin API so
+  # each app service is reachable through Kong once it's healthy. Runs
+  # once per `docker compose up` and exits; safe to re-run (idempotent).
+  # ---------------------------------------------------------------------
+  kong-config:
+    image: curlimages/curl:8.10.1
+    container_name: kong-config
+    restart: "no"
+    volumes:
+      - ./infra/kong/bootstrap.sh:/bootstrap.sh:ro
+    entrypoint: ["sh", "/bootstrap.sh"]
+    depends_on:
+      kong:
+        condition: service_healthy
+      llm-gateway:
+        condition: service_healthy
+      agent-registry:
+        condition: service_started
+      mcp-registry:
+        condition: service_started
+      mcp-gateway:
+        condition: service_started
+
+networks:
+  default:
+    name: agentic-platform
+
+volumes:
+  kong-db-data:
+  llm-gateway-db-data:
+  agent-registry-db-data:
